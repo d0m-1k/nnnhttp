@@ -7,4 +7,5 @@ import java.lang.annotation.*;
 @Documented
 public @interface Route {
     String path();
+    String method() default "GET";
 }

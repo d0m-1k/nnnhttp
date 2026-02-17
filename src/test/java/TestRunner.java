@@ -1,5 +1,5 @@
 import pro.nnnteam.httplib.HTTPMain;
 
-void main(String[] args) {
-    HTTPMain.main(args);
+void main() {
+    HTTPMain.main(new String[0]);
 }
