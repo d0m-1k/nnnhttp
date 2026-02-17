@@ -1,5 +1,6 @@
 package pro.nnnteam.httplib;
 
+import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 import com.sun.net.httpserver.HttpsConfigurator;
 import com.sun.net.httpserver.HttpsServer;
@@ -15,9 +16,7 @@ import java.io.*;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.net.InetSocketAddress;
-import java.net.URI;
 import java.net.URL;
-import java.nio.charset.StandardCharsets;
 import java.security.*;
 import java.security.cert.CertificateException;
 import java.util.HashMap;
@@ -29,6 +28,7 @@ public class HTTPMain {
     private static final String CONFIG_FILE = "nnnhttp.properties";
     private static HashMap<Route, Method> handlers = new HashMap<>();
     private static HttpServer server = null;
+    private static Properties properties;
 
     private static boolean isRunningFromJar() {
         CodeSource source = HTTPMain.class.getProtectionDomain().getCodeSource();
@@ -157,8 +157,8 @@ public class HTTPMain {
     }
 
     public static void main(String[] args) {
-        Properties props = loadProperties(CONFIG_FILE);
-        Class<?> mainClass = findMainClass(props);
+        properties = loadProperties(CONFIG_FILE);
+        Class<?> mainClass = findMainClass(properties);
         if (mainClass == null) {
             LOG.error("Cannot find main class.");
             throw new IllegalStateException("Main class not found");
@@ -171,82 +171,25 @@ public class HTTPMain {
         });
 
         try {
-            String host = props.getProperty("server.host", "0.0.0.0");
-            int port = Integer.parseInt(props.getProperty("server.port", "8080"));
-            int backlog = Integer.parseInt(props.getProperty("server.backlog", "5"));
-            boolean enableHttps = "true".equals(props.getProperty("server.ssl.enabled", "false"));
+            String host = properties.getProperty("server.host", "0.0.0.0");
+            int port = Integer.parseInt(properties.getProperty("server.port", "8080"));
+            int backlog = Integer.parseInt(properties.getProperty("server.backlog", "5"));
+            boolean enableHttps = "true".equals(properties.getProperty("server.ssl.enabled", "false"));
             InetSocketAddress addr = new InetSocketAddress(host, port);
 
             if (enableHttps) {
                 server = HttpsServer.create(addr, backlog);
-                SSLContext sslContext = createSSLContext(props);
+                SSLContext sslContext = createSSLContext(properties);
                 ((HttpsServer) server).setHttpsConfigurator(new HttpsConfigurator(sslContext));
             } else {
                 server = HttpServer.create(addr, backlog);
             }
 
-            for (Map.Entry<String, Map<String, Method>> entry : pathHandlers.entrySet()) {
-                String path = entry.getKey();
-                Map<String, Method> methodMap = entry.getValue();
+            server.createContext("/", exchange -> {
+                mainHandler(exchange.getRequestURI().getPath(), exchange.getRequestMethod(), exchange);
+            });
 
-                server.createContext(path, exchange -> {
-                    String requestMethod = exchange.getRequestMethod().toLowerCase();
-                    Method handler = methodMap.get(requestMethod);
-
-                    if (handler == null) {
-                        String response = "Method Not Allowed";
-                        exchange.sendResponseHeaders(405, response.getBytes(StandardCharsets.UTF_8).length);
-                        try (OutputStream os = exchange.getResponseBody()) {
-                            os.write(response.getBytes(StandardCharsets.UTF_8));
-                        }
-                        return;
-                    }
-
-                    int resultCode = 200;
-                    try {
-                        Object result = handler.invoke(null);
-
-                        byte[] responseBytes;
-                        if (result instanceof HTTPResult httpResult) {
-                            responseBytes = httpResult.getData();
-                            resultCode = httpResult.getResultCode();
-
-                            for (Map.Entry<String, String> header : httpResult.getHeaders().entrySet()) {
-                                exchange.getResponseHeaders().set(header.getKey(), header.getValue());
-                            }
-
-                            String contentType = httpResult.getContentType();
-                            if (contentType != null && !contentType.isEmpty()
-                                    && !exchange.getResponseHeaders().containsKey("Content-Type")) {
-                                exchange.getResponseHeaders().set("Content-Type", contentType);
-                            }
-                        } else {
-                            responseBytes = result.toString().getBytes(StandardCharsets.UTF_8);
-                            exchange.getResponseHeaders().set("Content-Type", "text/plain; charset=UTF-8");
-                        }
-
-                        exchange.sendResponseHeaders(resultCode, responseBytes.length);
-                        try (OutputStream os = exchange.getResponseBody()) {
-                            os.write(responseBytes);
-                        }
-                    } catch (IllegalAccessException | InvocationTargetException err) {
-                        LOG.error("Failed to invoke method `{}`: {}", handler.getName(), err.getMessage());
-                        byte[] errorBytes = "Internal Server Error".getBytes(StandardCharsets.UTF_8);
-                        exchange.sendResponseHeaders(500, errorBytes.length);
-                        try (OutputStream os = exchange.getResponseBody()) {
-                            os.write(errorBytes);
-                        }
-                    } catch (IOException err) {
-                        LOG.error("IO error while sending response for {}: {}", path, err.getMessage());
-                    }
-
-                    LOG.info("{} {} {} - {}",
-                            exchange.getRequestMethod().toUpperCase(), exchange.getRequestURI().getPath(),
-                            resultCode, exchange.getRemoteAddress().getAddress().getHostAddress());
-                });
-            }
-
-            int shutdownDelay = Integer.parseInt(props.getProperty("server.shutdownTimeout", "5"));
+            int shutdownDelay = Integer.parseInt(properties.getProperty("server.shutdownTimeout", "5"));
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
                 if (server != null) {
                     LOG.warn("Shutting down server...");
@@ -265,5 +208,69 @@ public class HTTPMain {
             LOG.error("Invalid port or backlog number: {}", err.getMessage());
             System.exit(1);
         }
+    }
+
+    private static void mainHandler(String path, String method, HttpExchange exchange) {
+        Route route = null;
+        Method handler = null;
+        for (Map.Entry<Route, Method> entry : handlers.entrySet()) {
+            Route r = entry.getKey(); Method m = entry.getValue();
+            if (path.equals(r.path()) && method.equals(r.method())) {
+                route = r;
+                handler = m;
+                break;
+            }
+        }
+
+        HTTPResult.Builder resultBuilder = new HTTPResult.Builder();
+
+        if (route == null || handler == null) {
+            if (!path.startsWith("@")) {
+                mainHandler("@404", method, exchange);
+                return;
+            } else {
+                resultBuilder.resultCode(404);
+                resultBuilder.data("Not Found");
+            }
+        } else {
+            try {
+                Object result = handler.invoke(null);
+                if (result instanceof HTTPResult httpResult) {
+                    resultBuilder.from(httpResult);
+                } else {
+                    resultBuilder.data(result.toString());
+                }
+            } catch (IllegalAccessException | InvocationTargetException err) {
+                LOG.error("Failed to invoke method `{}`: {}", handler.getName(), err.getMessage());
+                resultBuilder.data("");
+                resultBuilder.resultCode(500);
+            }
+        }
+
+        HTTPResult result = resultBuilder.build();
+        try {
+            exchange.getResponseHeaders().add("content-type", result.getContentType());
+            exchange.getResponseHeaders().add("server", properties.getProperty("server.headers.server", "nnnlib"));
+            result.getHeaders().forEach((String key, String value) -> exchange.getResponseHeaders().add(key, value));
+            properties.forEach((Object k, Object v) -> {
+                String key = (String) k; String value = (String) v;
+                if (key.startsWith("server.headers.")) {
+                    key = key.substring("server.headers.".length());
+                    if (exchange.getResponseHeaders().getOrDefault(key, null) != null) return;
+                    exchange.getResponseHeaders().add(key, value);
+                    LOG.debug("Add header: {}: {}", key, value);
+                }
+            });
+            exchange.sendResponseHeaders(result.getResultCode(), result.getData().length);
+            try (OutputStream os = exchange.getResponseBody()) {
+                os.write(result.getData());
+            }
+        } catch (IOException err) {
+            LOG.error("IO error while sending response for {}: {}", path, err.getMessage());
+        }
+
+        LOG.info("{} {} {} - {}",
+                exchange.getRequestMethod().toUpperCase(), exchange.getRequestURI().getPath(),
+                result.getResultCode(), exchange.getRemoteAddress().getAddress().getHostAddress());
     }
 }

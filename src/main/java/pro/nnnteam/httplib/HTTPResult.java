@@ -8,9 +8,8 @@ public class HTTPResult {
     private byte[] data = null;
     private int resultCode = 200;
     private String contentType = "text/html";
-    private HashMap<String, String> headers = new HashMap<>();
+    private Map<String, String> headers = new HashMap<>();
 
-    // Геттеры
     public byte[] getData() { return data; }
     public int getResultCode() { return resultCode; }
     public String getContentType() { return contentType; }
@@ -25,9 +24,18 @@ public class HTTPResult {
         public Builder contentType(String contentType) { httpResult.contentType = contentType; return this; }
         public Builder putHeader(String key, String value) {
             if (httpResult.headers == null) httpResult.headers = new HashMap<>();
-            httpResult.headers.put(key, value);
+            httpResult.headers.put(key.toLowerCase(), value);
             return this;
         }
+
+        public Builder from(HTTPResult result) {
+            httpResult.data = result.getData();
+            httpResult.resultCode = result.getResultCode();
+            httpResult.contentType = result.getContentType();
+            httpResult.headers = result.getHeaders();
+            return this;
+        }
+
         public HTTPResult build() { return httpResult; }
     }
 }
