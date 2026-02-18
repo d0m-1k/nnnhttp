@@ -6,8 +6,7 @@ import com.sun.net.httpserver.HttpsConfigurator;
 import com.sun.net.httpserver.HttpsServer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import pro.nnnteam.httplib.annotation.Route;
-import pro.nnnteam.httplib.annotation.StartEntry;
+import pro.nnnteam.httplib.annotation.*;
 
 import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
@@ -15,20 +14,60 @@ import javax.net.ssl.TrustManagerFactory;
 import java.io.*;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
+import java.lang.reflect.Parameter;
 import java.net.InetSocketAddress;
 import java.net.URL;
+import java.nio.charset.StandardCharsets;
 import java.security.*;
 import java.security.cert.CertificateException;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.Properties;
+import java.util.*;
 
 public class HTTPMain {
     private static final Logger LOG = LoggerFactory.getLogger(HTTPMain.class);
     private static final String CONFIG_FILE = "nnnhttp.properties";
-    private static HashMap<Route, Method> handlers = new HashMap<>();
+
+    private static final List<RouteInfo> routeInfos = new ArrayList<>();
     private static HttpServer server = null;
     private static Properties properties;
+    private static Object controllerInstance;
+
+    private static final ThreadLocal<Map<String, String>> currentPathParams = new ThreadLocal<>();
+
+    private static class RouteInfo {
+        final String pattern;
+        final Method method;
+        final List<String> paramNames;
+        final List<String> segments;
+
+        RouteInfo(Route route, Method method) {
+            this.pattern = route.path();
+            this.method = method;
+            this.segments = Arrays.asList(pattern.split("/"));
+            this.paramNames = new ArrayList<>();
+            for (String seg : segments) {
+                if (seg.startsWith("{") && seg.endsWith("}")) {
+                    paramNames.add(seg.substring(1, seg.length() - 1));
+                }
+            }
+        }
+
+        Map<String, String> match(String path) {
+            String[] pathSegments = path.split("/");
+            if (pathSegments.length != segments.size()) return null;
+
+            Map<String, String> params = new HashMap<>();
+            for (int i = 0; i < segments.size(); i++) {
+                String patternSeg = segments.get(i);
+                String pathSeg = pathSegments[i];
+                if (patternSeg.startsWith("{") && patternSeg.endsWith("}")) {
+                    params.put(patternSeg.substring(1, patternSeg.length() - 1), pathSeg);
+                } else if (!patternSeg.equals(pathSeg)) {
+                    return null;
+                }
+            }
+            return params;
+        }
+    }
 
     private static boolean isRunningFromJar() {
         CodeSource source = HTTPMain.class.getProtectionDomain().getCodeSource();
@@ -57,24 +96,23 @@ public class HTTPMain {
         String mainClass = props.getProperty("mainClass", null);
 
         if (mainClass == null) {
-            // TODO: Поиск класса вручную
-            LOG.debug("mainClass is null");
+            LOG.debug("mainClass is null, no automatic scan yet");
             return null;
         }
 
-        if (mainClass.isEmpty()) {
+        if (mainClass.trim().isEmpty()) {
             LOG.debug("mainClass is empty");
             return null;
         }
 
         try {
-            Class<?> clazz = Class.forName(mainClass);
+            Class<?> clazz = Class.forName(mainClass.trim());
             if (clazz.isAnnotationPresent(StartEntry.class)) {
                 return clazz;
             }
             LOG.debug("{} not annotated @StartEntry", clazz.getName());
         } catch (ClassNotFoundException ignored) {
-            LOG.debug("Class Not Found Exception handled");
+            LOG.debug("Class not found: " + mainClass);
         }
 
         return null;
@@ -84,12 +122,8 @@ public class HTTPMain {
         for (Method method : clazz.getDeclaredMethods()) {
             Route route = method.getAnnotation(Route.class);
             if (route != null) {
-                if (method.getParameterCount() == 0) {
-                    handlers.put(route, method);
-                    LOG.debug("Registered route {} -> {}", route.path(), method.getName());
-                } else {
-                    LOG.warn("Method {} annotated with @Route has parameters, ignored", method.getName());
-                }
+                routeInfos.add(new RouteInfo(route, method));
+                LOG.debug("Registered route {} -> {}", route.path(), method.getName());
             }
         }
     }
@@ -156,19 +190,22 @@ public class HTTPMain {
         } else return new FileInputStream(path);
     }
 
-    public static void main(String[] args) {
+    public static void main() {
         properties = loadProperties(CONFIG_FILE);
         Class<?> mainClass = findMainClass(properties);
         if (mainClass == null) {
             LOG.error("Cannot find main class.");
             throw new IllegalStateException("Main class not found");
         }
-        registerRouteHandlers(mainClass);
 
-        Map<String, Map<String, Method>> pathHandlers = new HashMap<>();
-        handlers.forEach((route, method) -> {
-            pathHandlers.computeIfAbsent(route.path(), k -> new HashMap<>()).put(route.method().toLowerCase(), method);
-        });
+        try {
+            controllerInstance = mainClass.getDeclaredConstructor().newInstance();
+        } catch (InstantiationException | IllegalAccessException | NoSuchMethodException | InvocationTargetException e) {
+            LOG.error("Failed to create instance of main class", e);
+            throw new RuntimeException("Cannot instantiate main class", e);
+        }
+
+        registerRouteHandlers(mainClass);
 
         try {
             String host = properties.getProperty("server.host", "0.0.0.0");
@@ -185,9 +222,7 @@ public class HTTPMain {
                 server = HttpServer.create(addr, backlog);
             }
 
-            server.createContext("/", exchange -> {
-                mainHandler(exchange.getRequestURI().getPath(), exchange.getRequestMethod(), exchange);
-            });
+            server.createContext("/", HTTPMain::handleRequest);
 
             int shutdownDelay = Integer.parseInt(properties.getProperty("server.shutdownTimeout", "5"));
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
@@ -210,67 +245,166 @@ public class HTTPMain {
         }
     }
 
-    private static void mainHandler(String path, String method, HttpExchange exchange) {
-        Route route = null;
-        Method handler = null;
-        for (Map.Entry<Route, Method> entry : handlers.entrySet()) {
-            Route r = entry.getKey(); Method m = entry.getValue();
-            if (path.equals(r.path()) && method.equals(r.method())) {
-                route = r;
-                handler = m;
+    private static void handleRequest(HttpExchange exchange) {
+        String path = exchange.getRequestURI().getPath();
+        String method = exchange.getRequestMethod().toUpperCase();
+
+        RouteInfo matchedInfo = null;
+        Map<String, String> pathParams = null;
+        for (RouteInfo info : routeInfos) {
+            Route route = info.method.getAnnotation(Route.class);
+            if (!method.equalsIgnoreCase(route.method())) continue;
+
+            Map<String, String> params = info.match(path);
+            if (params != null) {
+                matchedInfo = info;
+                pathParams = params;
                 break;
             }
         }
 
         HTTPResult.Builder resultBuilder = new HTTPResult.Builder();
 
-        if (route == null || handler == null) {
-            if (!path.startsWith("@")) {
-                mainHandler("@404", method, exchange);
-                return;
-            } else {
-                resultBuilder.resultCode(404);
-                resultBuilder.data("Not Found");
-            }
+        if (matchedInfo == null) {
+            resultBuilder.resultCode(404).data("Not Found".getBytes(StandardCharsets.UTF_8));
         } else {
+            currentPathParams.set(pathParams);
             try {
-                Object result = handler.invoke(null);
-                if (result instanceof HTTPResult httpResult) {
-                    resultBuilder.from(httpResult);
-                } else {
-                    resultBuilder.data(result.toString());
-                }
-            } catch (IllegalAccessException | InvocationTargetException err) {
-                LOG.error("Failed to invoke method `{}`: {}", handler.getName(), err.getMessage());
-                resultBuilder.data("");
-                resultBuilder.resultCode(500);
+                invoke(resultBuilder, matchedInfo.method, exchange);
+            } finally {
+                currentPathParams.remove();
             }
         }
 
         HTTPResult result = resultBuilder.build();
+
         try {
-            exchange.getResponseHeaders().add("content-type", result.getContentType());
-            exchange.getResponseHeaders().add("server", properties.getProperty("server.headers.server", "nnnlib"));
-            result.getHeaders().forEach((String key, String value) -> exchange.getResponseHeaders().add(key, value));
-            properties.forEach((Object k, Object v) -> {
-                String key = (String) k; String value = (String) v;
+            if (result.getContentType() != null) {
+                exchange.getResponseHeaders().set("Content-Type", result.getContentType());
+            }
+            exchange.getResponseHeaders().set("Server", properties.getProperty("server.headers.server", "nnnlib"));
+            result.getHeaders().forEach(exchange.getResponseHeaders()::set);
+
+            properties.forEach((keyObj, valueObj) -> {
+                String key = (String) keyObj;
                 if (key.startsWith("server.headers.")) {
-                    key = key.substring("server.headers.".length());
-                    if (exchange.getResponseHeaders().getOrDefault(key, null) != null) return;
-                    exchange.getResponseHeaders().add(key, value);
-                    LOG.debug("Add header: {}: {}", key, value);
+                    String headerName = key.substring("server.headers.".length());
+                    if (!exchange.getResponseHeaders().containsKey(headerName)) {
+                        exchange.getResponseHeaders().set(headerName, (String) valueObj);
+                    }
                 }
             });
-            exchange.sendResponseHeaders(result.getResultCode(), result.getData().length);
+
+            byte[] data = result.getData();
+            if (data == null) data = new byte[0];
+            exchange.sendResponseHeaders(result.getResultCode(), data.length);
             try (OutputStream os = exchange.getResponseBody()) {
-                os.write(result.getData());
+                os.write(data);
             }
-        } catch (IOException err) {
-            LOG.error("IO error while sending response for {}: {}", path, err.getMessage());
+        } catch (IOException e) {
+            LOG.error("IO error while sending response for {}: {}", path, e.getMessage());
         }
 
         LOG.info("{} {} {} - {}",
-                exchange.getRequestMethod().toUpperCase(), exchange.getRequestURI().getPath(),
+                exchange.getRequestMethod().toUpperCase(), path,
                 result.getResultCode(), exchange.getRemoteAddress().getAddress().getHostAddress());
+    }
+
+    private static void invoke(HTTPResult.Builder resultBuilder, Method handler, HttpExchange exchange) {
+        try {
+            Object[] args = prepareArguments(handler, exchange);
+            Object result = handler.invoke(controllerInstance, args);
+
+            if (result instanceof HTTPResult httpResult) {
+                resultBuilder.data(httpResult.getData())
+                        .resultCode(httpResult.getResultCode())
+                        .contentType(httpResult.getContentType());
+                for (Map.Entry<String, String> entry : httpResult.getHeaders().entrySet()) {
+                    resultBuilder.putHeader(entry.getKey(), entry.getValue());
+                }
+            } else {
+                String str = result != null ? result.toString() : "";
+                resultBuilder.data(str.getBytes(StandardCharsets.UTF_8));
+            }
+        } catch (IllegalAccessException | InvocationTargetException e) {
+            LOG.error("Failed to invoke method `{}`: {}", handler.getName(), e.getMessage());
+            resultBuilder.data("Internal Server Error".getBytes(StandardCharsets.UTF_8)).resultCode(500);
+        } catch (IllegalArgumentException e) {
+            LOG.error("Invalid arguments for method `{}`: {}", handler.getName(), e.getMessage());
+            resultBuilder.data("Bad Request".getBytes(StandardCharsets.UTF_8)).resultCode(400);
+        }
+    }
+
+    private static Object[] prepareArguments(Method handler, HttpExchange exchange) {
+        Parameter[] parameters = handler.getParameters();
+        Object[] args = new Object[parameters.length];
+
+        for (int i = 0; i < parameters.length; i++) {
+            Parameter param = parameters[i];
+            Class<?> type = param.getType();
+
+            if (type.equals(HttpExchange.class)) {
+                args[i] = exchange;
+                continue;
+            }
+
+            PathParam pathParam = param.getAnnotation(PathParam.class);
+            if (pathParam != null) {
+                String value = extractPathParam(exchange.getRequestURI().getPath(), pathParam.value());
+                args[i] = convert(value, type);
+                continue;
+            }
+
+            QueryParam queryParam = param.getAnnotation(QueryParam.class);
+            if (queryParam != null) {
+                String value = null;
+                String query = exchange.getRequestURI().getQuery();
+                if (query != null) {
+                    value = extractQueryParam(query, queryParam.value());
+                }
+                if (value == null) value = queryParam.defaultValue();
+                args[i] = convert(value, type);
+                continue;
+            }
+
+            Body body = param.getAnnotation(Body.class);
+            if (body != null) {
+                try (InputStream is = exchange.getRequestBody()) {
+                    String bodyString = new String(is.readAllBytes(), StandardCharsets.UTF_8);
+                    args[i] = convert(bodyString, type);
+                } catch (IOException e) {
+                    throw new IllegalArgumentException("Failed to read request body", e);
+                }
+                continue;
+            }
+
+            throw new IllegalArgumentException("Parameter " + param.getName() + " has no annotation");
+        }
+        return args;
+    }
+
+    private static String extractPathParam(String path, String name) {
+        Map<String, String> params = currentPathParams.get();
+        return params != null ? params.get(name) : null;
+    }
+
+    private static String extractQueryParam(String query, String name) {
+        for (String pair : query.split("&")) {
+            String[] kv = pair.split("=");
+            if (kv.length > 0 && kv[0].equals(name)) {
+                return kv.length > 1 ? kv[1] : "";
+            }
+        }
+        return null;
+    }
+
+    private static Object convert(String value, Class<?> targetType) {
+        if (value == null) return null;
+        if (targetType.equals(String.class)) return value;
+        if (targetType.equals(int.class) || targetType.equals(Integer.class)) return Integer.parseInt(value);
+        if (targetType.equals(long.class) || targetType.equals(Long.class)) return Long.parseLong(value);
+        if (targetType.equals(boolean.class) || targetType.equals(Boolean.class)) return Boolean.parseBoolean(value);
+        if (targetType.equals(byte[].class)) return value.getBytes(StandardCharsets.UTF_8);
+        throw new IllegalArgumentException("Unsupported parameter type: " + targetType);
     }
 }
